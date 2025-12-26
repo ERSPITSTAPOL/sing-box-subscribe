@@ -1,7 +1,7 @@
-requests
-paramiko
-scp
-chardet
-PyYAML
-ruamel.yaml
-Flask==2.3.2
+requests==2.32.5
+paramiko==4.0.0
+scp==0.15.0
+chardet==5.2.0
+PyYAML==6.0.3
+ruamel.yaml==0.18.16
+Flask==3.1.2

@@ -1,43 +1,96 @@
-import tool,re
+import re
 from urllib.parse import urlparse, parse_qs, unquote
+import tool
 
-def parse(data):
-    info = data[:]
+def split_host_port(netloc: str):
+    netloc = netloc.rstrip('/')    
+    if netloc.startswith('['):
+        host_end = netloc.find(']')
+        if host_end == -1:
+            return netloc, None
+        host = netloc[1:host_end]
+        port_part = netloc[host_end+1:]
+        if port_part.startswith(':'):
+            port = port_part[1:]
+        else:
+            port = None
+    else:
+        if ':' in netloc:
+            host, port = netloc.rsplit(':', 1)
+        else:
+            host, port = netloc, None
+    return host, port
+
+def parse(data: str) -> dict:
+    info = data.strip()
     server_info = urlparse(info)
-    netquery = dict(
-        (k, v if len(v) > 1 else v[0])
+    netquery = {
+        k: v if len(v) > 1 else v[0]
         for k, v in parse_qs(server_info.query).items()
-    )
-    if server_info.path:
-      server_info = server_info._replace(netloc=server_info.netloc + server_info.path, path="")
-    ports_match = re.search(r',(\d+-\d+)', server_info.netloc)
+    }
+    host = server_info.hostname
+    port = server_info.port
+    if not host:
+        temp_netloc = server_info.netloc
+        if server_info.path and server_info.path != '/':
+            temp_netloc += server_info.path
+            
+        netloc_tail = temp_netloc.split("@")[-1]
+        host, port_str = split_host_port(netloc_tail)
+        if port_str:
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = None
+    password = netquery.get('auth') or server_info.username
+    if not password and "@" in server_info.netloc:
+        password = server_info.netloc.split("@")[0].rsplit(":", 1)[-1]
     node = {
-        'tag': unquote(server_info.fragment) or tool.genName()+'_hysteria2',
+        'tag': unquote(server_info.fragment) or tool.genName() + '_hysteria2',
         'type': 'hysteria2',
-        'server': re.sub(r"\[|\]", "", server_info.netloc.split("@")[-1].rsplit(":", 1)[0]),
-        'server_port': int(re.search(r'\d+', server_info.netloc.rsplit(":", 1)[-1].split(",")[0]).group()),
-        "password": netquery['auth'] if netquery.get('auth') else server_info.netloc.split("@")[0].rsplit(":", 1)[-1],
-        'up_mbps': int(re.search(r'\d+', netquery.get('upmbps', '10')).group()),
-        'down_mbps': int(re.search(r'\d+', netquery.get('downmbps', '100')).group()),
+        'server': host,
+        "password": password,
         'tls': {
             'enabled': True,
             'server_name': netquery.get('sni', netquery.get('peer', '')),
             'insecure': False
         }
     }
-    if ports_match:
-        node['server_ports'] = [ports_match.group(1).replace('-', ':')]
-    if netquery.get('insecure') in ['1', 'true'] or netquery.get('allowInsecure') == '1':
+    ranges = []
+    if 'mport' in netquery:
+        m = re.match(r'^(\d{1,5})-(\d{1,5})$', str(netquery['mport']))
+        if m:
+            start_port, end_port = int(m.group(1)), int(m.group(2))
+            if 1 <= start_port <= 65535 and 1 <= end_port <= 65535 and start_port <= end_port:
+                ranges.append(f"{start_port}:{end_port}")
+    if port and 1 <= port <= 65535:
+        node['server_port'] = port
+    else:
+        node['server_port'] = 443
+    if ranges:
+        node['server_ports'] = ranges[0] if len(ranges) == 1 else ranges
+    if netquery.get('insecure') in ['1', 'true', 'TRUE'] or netquery.get('allowInsecure') == '1':
         node['tls']['insecure'] = True
-    if not node['tls'].get('server_name'):
-        del node['tls']['server_name']
-        node['tls']['insecure'] = True
-    elif node['tls']['server_name'] == 'None':
-        del node['tls']['server_name']
-    node['tls']['alpn'] = (netquery.get('alpn') or "h3").strip('{}').split(',')
-    if netquery.get('obfs', '') not in ['none', '']:
+        
+    if not node['tls'].get('server_name') or node['tls']['server_name'] == 'None':
+        node['tls'].pop('server_name', None)
+    if 'alpn' in netquery:
+        alpn_val = netquery['alpn']
+        if isinstance(alpn_val, list):
+            node['tls']['alpn'] = [str(v).strip('{}') for v in alpn_val]
+        else:
+            node['tls']['alpn'] = alpn_val.strip('{}').split(',')
+    if netquery.get('obfs') not in ['none', '', None]:
         node['obfs'] = {
             'type': netquery['obfs'],
-            'password': netquery['obfs-password'],
+            'password': netquery.get('obfs-password', '')
         }
-    return (node)
+    upmbps = netquery.get('upmbps')
+    downmbps = netquery.get('downmbps')
+    if upmbps and str(upmbps).isdigit():
+        node['up_mbps'] = int(upmbps)
+    if downmbps and str(downmbps).isdigit():
+        node['down_mbps'] = int(downmbps)
+    if 'pinSHA256' in netquery:
+        node['tls']['fingerprint'] = netquery['pinSHA256']
+    return node
