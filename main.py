@@ -40,12 +40,11 @@ def process_subscribes(subscribes):
     for subscribe in subscribes:
         if 'enabled' in subscribe and not subscribe['enabled']:
             continue
-        if 'sing-box-subscribe-doraemon.vercel.app' in subscribe['url']:
-            continue
         _nodes = get_nodes(subscribe['url'])
         if _nodes and len(_nodes) > 0:
-            add_prefix(_nodes, subscribe)
             add_emoji(_nodes, subscribe)
+            add_prefix(_nodes, subscribe)
+            add_suffix(_nodes, subscribe)
             nodefilter(_nodes, subscribe)
             if subscribe.get('subgroup'):
                 subscribe['tag'] = subscribe['tag'] + '-' + subscribe['subgroup'] + '-' + 'subgroup'
@@ -100,6 +99,7 @@ def add_prefix(nodes, subscribe):
             node['tag'] = subscribe['prefix'] + node['tag']
             if node.get('detour'):
                 node['detour'] = subscribe['prefix'] + node['detour']
+def add_suffix(nodes, subscribe):
     # 添加后缀
     if subscribe.get('suffix'):
         for node in nodes:
