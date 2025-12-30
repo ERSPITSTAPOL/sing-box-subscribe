@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, Response
-from urllib.parse import quote, urlparse, unquote, unquote_plus, parse_qs, parse_qsl
+from urllib.parse import quote, urlparse, unquote, parse_qs, parse_qsl
 import json
 import os
 import sys
@@ -160,7 +160,6 @@ def config(url):
                         content_type='application/json; charset=utf-8', status=403)
 
     temp_json_data = json.loads(data_json['TEMP_JSON_DATA'])
-
     subscribes = temp_json_data['subscribes']
 
     def normalize_scheme(u: str) -> str:
@@ -171,61 +170,37 @@ def config(url):
         if u.startswith('https:/') and not u.startswith('https://'):
             return 'https://' + u[len('https:/'):]
         return u
-
-    def safe_unquote(value: str, max_rounds: int = 3) -> str:
-        if not isinstance(value, str) or value == "":
-            return value
-        cur = value
-        for _ in range(max_rounds):
-            decoded = unquote_plus(cur)
-            if decoded == cur:
-                break
-            cur = decoded
-        return cur
-
+    encoded_url = normalize_scheme(url) 
     query_string = request.query_string.decode('utf-8')
-    encoded_url = unquote(url)
-    encoded_url = normalize_scheme(encoded_url)
     index_of_colon = encoded_url.find(":")
-
+    special_keys = ['&emoji=', '&file=', '&eps=', '&enn=', '&prefix=', '&suffix=', '&tag=', '&ua=', '&UA=', '&gh=']
     if not query_string:
-        if any(substring in encoded_url for substring in ['&emoji=', '&file=', '&eps=', '&enn=', '&prefix=', '&suffix=', '&tag=', '&ua=', '&UA=', '&gh=']):
+        if any(substring in encoded_url for substring in special_keys):
             if '|' in encoded_url:
                 param = urlparse(encoded_url.rsplit('&', 1)[-1])
             else:
                 param = urlparse(encoded_url.split('&', 1)[-1])
-            request.args = dict(item.split('=') for item in param.path.split('&'))
-            for key in ['prefix','suffix','eps','enn','file','tag','ua','UA','emoji','gh']:
-                if request.args.get(key):
-                    request.args[key] = unquote(request.args[key])
-            if request.args.get('file'):
-                request.args['file'] = normalize_scheme(request.args['file'])
-            if request.args.get('file'):
-                index = request.args.get('file').find(":")
+            new_args = dict(item.split('=') for item in param.path.split('&') if '=' in item)
+            if 'file' in new_args:
+                new_args['file'] = normalize_scheme(new_args['file'])
+                index = new_args['file'].find(":")
                 next_index = index + 2
-                if index != -1:
-                    if next_index < len(request.args['file']) and request.args['file'][next_index] != "/":
-                        request.args['file'] = request.args['file'][:next_index-1] + "/" + request.args['file'][next_index-1:]
+                if index != -1 and next_index < len(new_args['file']) and new_args['file'][next_index] != "/":
+                    new_args['file'] = new_args['file'][:next_index-1] + "/" + new_args['file'][next_index-1:]
+            request.args = new_args
     else:
-        if any(substring in query_string for substring in ['&emoji=', '&file=', '&eps=', '&enn=', '&prefix=', '&suffix=', '&tag=', '&ua=', '&UA=', '&gh=']):
-            param = urlparse(query_string.split('&', 1)[-1])
-            request.args = dict(item.split('=') for item in param.path.split('&'))
-            for key in ['prefix','suffix','eps','enn','file','tag','ua','UA','emoji','gh']:
-                if request.args.get(key):
-                    request.args[key] = unquote(request.args[key])
-            if request.args.get('file'):
-                request.args['file'] = normalize_scheme(request.args['file'])
-            if request.args.get('file'):
-                index = request.args.get('file').find(":")
+        if any(substring in query_string for substring in special_keys):
+            param_part = query_string.split('&', 1)[-1]
+            param = urlparse(param_part)
+            new_args = dict(item.split('=') for item in param.path.split('&') if '=' in item)
+            if 'file' in new_args:
+                new_args['file'] = unquote(new_args['file']) 
+                new_args['file'] = normalize_scheme(new_args['file'])
+                index = new_args['file'].find(":")
                 next_index = index + 2
-                if index != -1:
-                    if next_index < len(request.args['file']) and request.args['file'][next_index] != "/":
-                        request.args['file'] = request.args['file'][:next_index-1] + "/" + request.args['file'][next_index-1:]
-            elif 'file=' in query_string:
-                index = query_string.find("file=")
-                request.args['file'] = query_string.split('file=')[-1].split('&', 1)[0]
-                request.args['file'] = normalize_scheme(request.args['file'])
-
+                if index != -1 and next_index < len(new_args['file']) and new_args['file'][next_index] != "/":
+                    new_args['file'] = new_args['file'][:next_index-1] + "/" + new_args['file'][next_index-1:]
+            request.args = new_args
     if index_of_colon != -1:
         next_char_index = index_of_colon + 2
         if next_char_index < len(encoded_url) and encoded_url[next_char_index] != "/":
@@ -237,7 +212,6 @@ def config(url):
             full_url = f"{encoded_url.split('&')[0]}"
         else:
             full_url = f"{encoded_url}"
-
     param_string = ""
     if query_string:
         param_string = query_string
@@ -248,14 +222,13 @@ def config(url):
             param_string = encoded_url.split('&', 1)[1]
         else:
             param_string = ""
-
     parsed = parse_qs(param_string, keep_blank_values=True)
 
     def get_param(name):
         vals = parsed.get(name)
         if not vals:
             return ''
-        return safe_unquote(vals[0], max_rounds=3)
+        return vals[0]
 
     emoji_param = get_param('emoji')
     file_param = get_param('file')
@@ -268,10 +241,8 @@ def config(url):
     enn_param = get_param('enn')
     gh_proxy_param = get_param('gh')
 
-
     file_param = normalize_scheme(file_param)
 
-    # 支持多个值，用 | 分隔
     emoji_list = emoji_param.split('|') if emoji_param else []
     file_list = file_param.split('|') if file_param else []
     tag_list = tag_param.split('|') if tag_param else []
@@ -281,11 +252,28 @@ def config(url):
     suffix_list = suf_param.split('|') if suf_param else []
     eps_list = eps_param.split('|') if eps_param else []
     enn_list = enn_param.split('|') if enn_param else []
-
-    # 构建要删除的字符串列表
+    
     params_to_remove = [
         f'&prefix={quote(pre_param)}',
         f'&suffix={quote(suf_param)}',
+        f'&ua={quote(ua_param)}',
+        f'&UA={quote(UA_param)}',
+        f'&file={quote(file_param)}',
+        f'file={quote(file_param)}',
+        f'&emoji={emoji_param}',
+        f'&tag={quote(tag_param)}',
+        f'&gh={quote(gh_proxy_param)}',
+        f'&eps={quote(eps_param)}',
+        f'&enn={quote(enn_param)}'
+    ]
+    full_url = full_url.replace(',', '%2C')
+    
+    for param in params_to_remove:
+        if param in full_url:
+            full_url = full_url.replace(param, '')
+    params_to_remove_raw = [
+        f'&prefix={pre_param}',
+        f'&suffix={suf_param}',
         f'&ua={ua_param}',
         f'&UA={UA_param}',
         f'&file={file_param}',
@@ -293,25 +281,23 @@ def config(url):
         f'&emoji={emoji_param}',
         f'&tag={tag_param}',
         f'&gh={gh_proxy_param}',
-        f'&eps={quote(eps_param)}',
-        f'&enn={quote(enn_param)}'
+        f'&eps={eps_param}',
+        f'&enn={enn_param}'
     ]
-    full_url = full_url.replace(',', '%2C')
-    for param in params_to_remove:
+    for param in params_to_remove_raw:
         if param in full_url:
             full_url = full_url.replace(param, '')
     if request.args.get('url'):
         full_url = full_url
     else:
         full_url = unquote(full_url)
-
     if '/api/v4/projects/' in full_url:
         parts = full_url.split('/api/v4/projects/')
         full_url = parts[0] + '/api/v4/projects/' + parts[1].replace('/', '%2F', 1)
-
     url_parts = full_url.split('|')
+
     existing_subs = temp_json_data.get('subscribes', [])
-    first_template = existing_subs[0]
+    first_template = existing_subs[0] if existing_subs else {}
 
     if len(url_parts) > len(existing_subs):
         new_subs = []
@@ -333,14 +319,17 @@ def config(url):
         sub['prefix'] = prefix_list[i] if len(prefix_list) > i else ''
         sub['suffix'] = suffix_list[i] if len(suffix_list) > i else ''
         sub['tag'] = tag_list[i] if len(tag_list) > i else sub.get('tag','')
-        sub['emoji'] = int(emoji_list[i]) if len(emoji_list) > i and emoji_list[i].isdigit() else sub.get('emoji',1)
+        try:
+            sub['emoji'] = int(emoji_list[i]) if len(emoji_list) > i and emoji_list[i].isdigit() else sub.get('emoji', 1)
+        except:
+            sub['emoji'] = 1
         sub['User-Agent'] = ua_list[i] if len(ua_list) > i else 'v2rayng'
         sub['ex-node-name'] = enn_list[i] if len(enn_list) > i else ''
         sub['enabled'] = True
         sub['subgroup'] = ''
 
     temp_json_data['exclude_protocol'] = eps_param if eps_param else temp_json_data.get('exclude_protocol', '')
-    temp_json_data['config_template'] = unquote(file_param) if file_param else temp_json_data.get('config_template', '')
+    temp_json_data['config_template'] = file_param if file_param else temp_json_data.get('config_template', '')
 
     try:
         selected_template_index = '0'
@@ -353,28 +342,25 @@ def config(url):
                 selected_gh_proxy_index = str(int(gh_proxy_param) - 1)
             else:
                 selected_gh_proxy_index = gh_proxy_param
-        temp_json_data = json.dumps(json.dumps(temp_json_data, indent=4, ensure_ascii=False), indent=4, ensure_ascii=False)
-        subprocess.check_call([sys.executable, 'main.py', '--template_index', selected_template_index, '--temp_json_data', temp_json_data, '--gh_proxy_index', selected_gh_proxy_index])
+
+        temp_json_data_str = json.dumps(json.dumps(temp_json_data, indent=4, ensure_ascii=False), indent=4, ensure_ascii=False)
+        subprocess.check_call([sys.executable, 'main.py', '--template_index', selected_template_index, '--temp_json_data', temp_json_data_str, '--gh_proxy_index', selected_gh_proxy_index])
         CONFIG_FILE_NAME = json.loads(os.environ['TEMP_JSON_DATA']).get("save_config_path", "config.json")
         if CONFIG_FILE_NAME.startswith("./"):
             CONFIG_FILE_NAME = CONFIG_FILE_NAME[2:]
-        # 设置配置文件的完整路径
         config_file_path = os.path.join('/tmp/', CONFIG_FILE_NAME) 
         if not os.path.exists(config_file_path):
-            config_file_path = CONFIG_FILE_NAME  # 使用相对于当前工作目录的路径 
+            config_file_path = CONFIG_FILE_NAME
         os.environ['TEMP_JSON_DATA'] = json.dumps(json.loads(data_json['TEMP_JSON_DATA']), indent=4, ensure_ascii=False)
-        # 读取配置文件内容
         with open(config_file_path, 'r', encoding='utf-8') as config_file:
             config_content = config_file.read()
-            if config_content:
-                flash('配置文件生成成功', 'success')
-        config_data = json.loads(config_content)
+            if config_content: flash('配置文件生成成功', 'success')
         return Response(config_content, content_type='application/json; charset=utf-8')
     except subprocess.CalledProcessError as e:
         os.environ['TEMP_JSON_DATA'] = json.dumps(json.loads(data_json['TEMP_JSON_DATA']), indent=4, ensure_ascii=False)
-        return Response(json.dumps({'status': 'error'}, indent=4,ensure_ascii=False), content_type='application/json; charset=utf-8', status=500)
+        return Response(json.dumps({'status': 'error', 'msg': str(e)}, indent=4,ensure_ascii=False), content_type='application/json; charset=utf-8', status=500)
     except Exception as e:
-        return Response(json.dumps({'status': 'error'}, indent=4,ensure_ascii=False), content_type='application/json; charset=utf-8', status=500)
+        return Response(json.dumps({'status': 'error', 'msg': str(e)}, indent=4,ensure_ascii=False), content_type='application/json; charset=utf-8', status=500)
 
 @app.route('/generate_config', methods=['POST'])
 def generate_config():
