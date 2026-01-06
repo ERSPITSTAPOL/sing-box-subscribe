@@ -46,6 +46,8 @@ def parse(data):
         node['tls']['server_name'] = netquery.get('sni', '') or netquery.get('peer', '')
         if node['tls']['server_name'] == 'None':
             node['tls']['server_name'] = ''
+        if netquery.get('alpn'):
+            node['tls']['alpn'] = [unquote(a.strip()) for a in netquery['alpn'].strip('{}').split(',') if a.strip()]
         if netquery.get('security') == 'reality' or netquery.get('pbk'): #shadowrocket
             node['tls']['reality'] = {
                 'enabled': True,

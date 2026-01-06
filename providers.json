@@ -1,31 +1,35 @@
 {
-    "subscribes":[
+    "subscribes": [
         {
             "url": "URL",
-            "tag": "tag_1",
             "enabled": true,
             "emoji": 1,
-            "subgroup": "",
+            "suffix": "",
             "prefix": "",
-            "User-Agent":"v2rayng"
+            "User-Agent": "",
+            "background": "",
+            "template": "",
+            "tag": "",
+            "subgroup": ""
         },
         {
             "url": "URL",
-            "tag": "tag_2",
             "enabled": false,
-            "emoji": 0,
-            "subgroup": "命名/named",
-            "prefix": "❤️",
-            "User-Agent":"clashmeta"
+            "emoji": 1,
+            "suffix": "",
+            "prefix": "",
+            "User-Agent": "",
+            "tag": "",
+            "subgroup": ""
         }
     ],
-    "auto_set_outbounds_dns":{
+    "auto_set_outbounds_dns": {
         "proxy": "",
         "direct": ""
     },
     "save_config_path": "./config.json",
     "auto_backup": false,
-    "exclude_protocol":"ssr",
+    "exclude_protocol": "ssr",
     "config_template": "",
     "Only-nodes": false
 }
