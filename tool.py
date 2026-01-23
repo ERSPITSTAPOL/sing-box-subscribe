@@ -1,9 +1,7 @@
-import base64,requests,random,string,re,chardet,urllib.parse
+import base64,random,string,re,chardet,urllib.parse
 import warnings
-from cryptography.utils import CryptographyDeprecationWarning
-with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
-    import paramiko
-from scp import SCPClient
+import httpx
+import asyncio
 
 def get_encoding(file):
     with open(file,'rb') as f:
@@ -158,6 +156,7 @@ regex_patterns = {
     '🇦🇶': re.compile(r'南极|南極|(\s|-)?AQ\d*|Antarctica'),
     '🇨🇳': re.compile(r'中国|中國|江苏|北京|上海|广州|深圳|杭州|徐州|青岛|宁波|镇江|沈阳|济南|回国|back|(\s|-)?CN(?!2GIA)\d*|China'),
 }
+
 def rename(input_str):
     for country_code, pattern in regex_patterns.items():
         if input_str.startswith(country_code):
@@ -245,7 +244,6 @@ def filterNodes(nodelist,keywords):
             newlist.append(node)
         else:
             print('过滤节点名称 '+node['name'])
-            print('Lọc tên proxy'+node['name'])
     return newlist
 
 def replaceStr(nodelist,keywords):
@@ -280,9 +278,7 @@ def removeNodes(nodelist):
             temp_list.append(_node)
             newlist.append(node)
     print('去除了 '+str(i)+' 个重复节点')
-    print('Đã xóa các proxy trùng lặp '+str(i))
     print('实际获取 '+str(len(newlist))+' 个节点')
-    print('Thực tế nhận được '+str(len(newlist))+' proxy')
     return newlist
 
 def prefixStr(nodelist,prestr):
@@ -290,20 +286,29 @@ def prefixStr(nodelist,prestr):
         node['name'] = prestr+node['name'].strip()
     return nodelist
 
-def getResponse(url, custom_user_agent=None):
-    response = None
+async def getResponse(url, custom_user_agent=None):
     headers = {
-        'User-Agent': custom_user_agent if custom_user_agent else 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15'
-        #'User-Agent': 'clash.meta'
+        'User-Agent': custom_user_agent if custom_user_agent else (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15'
+        )
     }
+    timeout = httpx.Timeout(10.0, connect=5.0)
     try:
-        response = requests.get(url,headers=headers,timeout=5000)
-        if response.status_code==200:
-            return response
-        else:
-            return None
-    except:
-        return None
+        async with httpx.AsyncClient(verify=True, timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response
+    except Exception:
+        pass
+    return None
     
 class ConfigSSH:
     server = {'ip':None,'port':22,'user':None,'password':''}
@@ -314,6 +319,9 @@ class ConfigSSH:
             if k in server.keys():
                 self.server[k] = server[k]
     def connect(self):
+        from cryptography.utils import CryptographyDeprecationWarning
+        with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
+            import paramiko
         ssh = paramiko.SSHClient()
         ssh.load_system_host_keys()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -325,12 +333,15 @@ class ConfigSSH:
         print(stdout.read().decode('utf-8')) 
 
     def uploadFile(self,source:str,target:str):
+        from scp import SCPClient
         scp = SCPClient(self.ssh.get_transport())
         scp.put(source, recursive=True, remote_path=target)
 
     def getFile(self,remote:str,local:str):
+        from scp import SCPClient
         scp = SCPClient(self.ssh.get_transport())
         scp.get(remote,local)
 
     def close(self):
-        self.ssh.close()
+        if hasattr(self, 'ssh'):
+            self.ssh.close()

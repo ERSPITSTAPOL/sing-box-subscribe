@@ -185,8 +185,11 @@ def clash2v2ray(share_link):
             "fp": share_link.get('client-fingerprint', ''),
             "type": share_link.get('network', 'tcp'),
             "flow": share_link.get('flow', ''),
+            "alpn": quote(",".join(share_link.get("alpn", [])) if isinstance(share_link.get("alpn"), list) else share_link.get("alpn", ""), 'utf-8'),
             'allowInsecure': '1' if share_link.get('skip-cert-verify') == True else '0',
-            "name": quote(share_link['name'], 'utf-8')
+            "name": quote(share_link['name'], 'utf-8'),
+            "ed": "",
+            "eh": ""
         }
         if share_link.get('tls') == False:
             vless_info["security"] = 'none'
@@ -195,7 +198,13 @@ def clash2v2ray(share_link):
         if vless_info['type'] == 'ws':
             vless_info["path"] = quote(share_link['ws-opts'].get('path', ''), 'utf-8') if share_link.get('ws-opts') else share_link.get('ws-path', '')
             vless_info["host"] = share_link['ws-opts'].get('headers', {}).get('Host', '') if share_link.get('ws-opts') else share_link.get('ws-headers', {}).get('Host', '')
-            link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&fp={fp}&type={type}&host={host}&path={path}&flow={flow}&allowInsecure={allowInsecure}".format(**vless_info)
+            if share_link.get('ws-opts'):
+                ws_opts = share_link['ws-opts']
+                if ws_opts.get('max-early-data') is not None:
+                    vless_info["ed"] = "&ed={}".format(ws_opts['max-early-data'])
+                if ws_opts.get('early-data-header-name'):
+                    vless_info["eh"] = "&eh={}".format(ws_opts['early-data-header-name'])
+            link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&fp={fp}&type={type}&host={host}&path={path}&flow={flow}&alpn={alpn}&allowInsecure={allowInsecure}{ed}{eh}".format(**vless_info)
         elif vless_info['type'] == 'grpc':
             if share_link.get('grpc-opts', {}).get('grpc-service-name', '') not in ['/', ''] :
                 vless_info["serviceName"] = unquote(share_link.get('grpc-opts').get('grpc-service-name'))
@@ -205,17 +214,17 @@ def clash2v2ray(share_link):
                 vless_info["security"] = 'reality'
                 vless_info["pbk"] = share_link['reality-opts']['public-key']
                 vless_info["sid"] = share_link.get('reality-opts', {}).get('short-id', '')
-                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&type={type}&serviceName={serviceName}&fp={fp}&flow={flow}&allowInsecure={allowInsecure}&pbk={pbk}&sid={sid}".format(**vless_info)
+                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&type={type}&serviceName={serviceName}&fp={fp}&flow={flow}&alpn={alpn}&allowInsecure={allowInsecure}&pbk={pbk}&sid={sid}".format(**vless_info)
             else:
-                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&type={type}&serviceName={serviceName}&fp={fp}&flow={flow}&allowInsecure={allowInsecure}".format(**vless_info)
+                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&type={type}&serviceName={serviceName}&fp={fp}&flow={flow}&alpn={alpn}&allowInsecure={allowInsecure}".format(**vless_info)
         elif vless_info['type'] == 'tcp':
             if share_link.get('reality-opts'):
                 vless_info["security"] = 'reality'
                 vless_info["pbk"] = share_link['reality-opts']['public-key']
                 vless_info["sid"] = share_link.get('reality-opts', {}).get('short-id', '')
-                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&serverName={sni}&type={type}&fp={fp}&flow={flow}&allowInsecure={allowInsecure}&pbk={pbk}&sid={sid}".format(**vless_info)
+                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&serverName={sni}&type={type}&fp={fp}&flow={flow}&alpn={alpn}&allowInsecure={allowInsecure}&pbk={pbk}&sid={sid}".format(**vless_info)
             else:
-                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&serverName={sni}&type={type}&fp={fp}&flow={flow}&allowInsecure={allowInsecure}".format(**vless_info)
+                link = "vless://{uuid}@{server}:{port}?encryption=none&security={security}&sni={sni}&serverName={sni}&type={type}&fp={fp}&flow={flow}&alpn={alpn}&allowInsecure={allowInsecure}".format(**vless_info)
         if share_link.get('smux',{}).get('enabled', '') == True:
             vless_info["protocol"] = share_link['smux']['protocol']
             vless_info["max_connections"] = share_link['smux'].get('max-connections','')
@@ -244,36 +253,44 @@ def clash2v2ray(share_link):
         return link
         # TODO
     elif share_link['type'] == 'hysteria':
+        raw_server = share_link['server']
+        formatted_server = f"[{raw_server}]" if ":" in raw_server and not raw_server.startswith("[") else raw_server
+        alpn_list = share_link.get('alpn', [])
+        alpn_str = quote(','.join(alpn_list) if isinstance(alpn_list, list) else str(alpn_list), 'utf-8')
         link = "hysteria://{server}:{port}?protocol={protocol}&auth={auth}&alpn={alpn}&insecure={allowInsecure}&peer={sni}&upmbps={upmbps}&downmbps={downmbps}&obfs={obfs}#{name}".format(
-        server = share_link['server'],
-        port = share_link['port'],
-        protocol = share_link.get('protocol', 'udp'),
-        auth = share_link.get('auth_str', share_link.get('auth-str')),
-        alpn = quote(','.join(share_link.get('alpn', '')), 'utf-8'),
-        allowInsecure = '0' if share_link.get('skip-cert-verify', '') == False else '1',
-        sni = share_link.get('sni', ''),
-        upmbps = int(re.search(r'\d+', str(share_link.get('up', '')))[0]),
-        downmbps = int(re.search(r'\d+', str(share_link.get('down', '')))[0]),
-        obfs = share_link.get('obfs', ''),
-        name = share_link['name'].encode('utf-8', 'surrogatepass').decode('utf-8')
+            server = formatted_server,
+            port = share_link['port'],
+            protocol = share_link.get('protocol', 'udp'),
+            auth = share_link.get('auth_str', share_link.get('auth-str', '')),
+            alpn = alpn_str,
+            allowInsecure = '0' if share_link.get('skip-cert-verify') == False else '1',
+            sni = share_link.get('sni', ''),
+            upmbps = int(re.search(r'\d+', str(share_link.get('up', '0'))).group()) if re.search(r'\d+', str(share_link.get('up', '0'))) else 0,
+            downmbps = int(re.search(r'\d+', str(share_link.get('down', '0'))).group()) if re.search(r'\d+', str(share_link.get('down', '0'))) else 0,
+            obfs = share_link.get('obfs', ''),
+            name = quote(share_link.get('name', ''))
         )
         return link
         # TODO
     elif share_link['type'] == 'hysteria2':
+        raw_server = share_link['server']
+        # formatted_server = f"[{raw_server}]" if ":" in raw_server and not raw_server.startswith("[") else raw_server
+        alpn_list = share_link.get('alpn', [])
+        alpn_str = quote(','.join(alpn_list) if isinstance(alpn_list, list) else str(alpn_list), 'utf-8')
         link = "hysteria2://{auth}@{server}:{port}{ports}?insecure={allowInsecure}&obfs={obfs}&obfs-password={obfspassword}&pinSHA256={fingerprint}&sni={sni}&alpn={alpn}&upmbps={upmbps}&downmbps={downmbps}#{name}".format(
-        auth = share_link.get('password', share_link.get('auth', '')),
-        server = share_link['server'],
-        port = share_link['port'],
-        ports=",{}".format(share_link['ports']) if share_link.get('ports') else '',
-        allowInsecure = '0' if share_link.get('skip-cert-verify', '') == False else '1',
-        obfs = share_link.get('obfs', 'none'),
-        obfspassword = share_link.get('obfs-password', ''),
-        fingerprint = share_link.get('fingerprint', ''),
-        sni = share_link.get('sni', ''),
-        alpn = quote(','.join(share_link.get('alpn', '')), 'utf-8'),
-        upmbps = share_link.get('up', ''),
-        downmbps = share_link.get('down', ''),
-        name = share_link['name'].encode('utf-8', 'surrogatepass').decode('utf-8')
+            auth = share_link.get('password', share_link.get('auth', '')),
+            server = raw_server,  # formatted_server
+            port = share_link['port'],
+            ports = ",{}".format(share_link['ports']) if share_link.get('ports') else '',
+            allowInsecure = '0' if share_link.get('skip-cert-verify') == False else '1',
+            obfs = share_link.get('obfs', 'none'),
+            obfspassword = share_link.get('obfs-password', ''),
+            fingerprint = share_link.get('fingerprint', ''),
+            sni = share_link.get('sni', ''),
+            alpn = alpn_str,
+            upmbps = share_link.get('up', ''),
+            downmbps = share_link.get('down', ''),
+            name = quote(share_link.get('name', ''))
         )
         return link
         # TODO
