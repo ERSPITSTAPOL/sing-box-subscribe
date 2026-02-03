@@ -1,9 +1,11 @@
-import base64,requests,random,string,re,chardet,urllib.parse
-import warnings
-from cryptography.utils import CryptographyDeprecationWarning
-with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
-    import paramiko
-from scp import SCPClient
+import base64
+import re
+import urllib.parse
+import chardet
+import random
+import string
+import httpx
+import asyncio
 
 def get_encoding(file):
     with open(file,'rb') as f:
@@ -158,15 +160,20 @@ regex_patterns = {
     '🇦🇶': re.compile(r'南极|南極|(\s|-)?AQ\d*|Antarctica'),
     '🇨🇳': re.compile(r'中国|中國|江苏|北京|上海|广州|深圳|杭州|徐州|青岛|宁波|镇江|沈阳|济南|回国|back|(\s|-)?CN(?!2GIA)\d*|China'),
 }
+
 def rename(input_str):
+    input_str = input_str.strip()
     for country_code, pattern in regex_patterns.items():
         if input_str.startswith(country_code):
-            return country_code + ' ' + input_str[len(country_code):].strip()
+            rest = input_str[len(country_code):].lstrip()
+            return f"{country_code} {rest}"
         if pattern.search(input_str):
             if input_str.startswith('🇺🇲'):
-                return country_code + ' ' + input_str[len('🇺🇲'):].strip()
+                return f"{country_code} {input_str[len('🇺🇲'):].strip()}"
             else:
-                return country_code + ' ' + input_str
+                if not input_str.startswith(country_code):
+                    return f"{country_code} {input_str}"
+                return input_str
     return input_str
 
 def b64Decode(str):
@@ -202,31 +209,23 @@ def firstLine(data):
 def genName(length=8):
     name = ''
     for i in range(length):
-        name += random.choice(string.ascii_letters+string.digits)
+        name += random.choice(string.ascii_letters + string.digits)
     return name
 
 def is_ip(str):
     return re.search(r'^\d+\.\d+\.\d+\.\d+$',str)
 
 def get_protocol(s):
-    try:
-        m = re.search(r'^(.+?)://', s)
-    except Exception as e:
+    if not isinstance(s, str) or '://' not in s:
         return None
-    if m:
-        if m.group(1) == 'hy2':
-            s = re.sub(r'^(.+?)://', 'hysteria2://', s)
-            m = re.search(r'^(.+?)://', s)
-        if m.group(1) == 'wireguard':
-            s = re.sub(r'^(.+?)://', 'wg://', s)
-            m = re.search(r'^(.+?)://', s)
-        if m.group(1) == 'http2':
-            s = re.sub(r'^(.+?)://', 'http://', s)
-            m = re.search(r'^(.+?)://', s)
-        if m.group(1) == 'socks5':
-            s = re.sub(r'^(.+?)://', 'socks://', s)
-            m = re.search(r'^(.+?)://', s)
-        return m.group(1)
+    proto = s.split('://', 1)[0].lower()
+    mapping = {
+        'hy2': 'hysteria2',
+        'wireguard': 'wg',
+        'http2': 'http',
+        'socks5': 'socks',
+    }
+    return mapping.get(proto, proto)
 
 def checkKeywords(keywords,str):
     if not keywords:
@@ -245,7 +244,6 @@ def filterNodes(nodelist,keywords):
             newlist.append(node)
         else:
             print('过滤节点名称 '+node['name'])
-            print('Lọc tên proxy'+node['name'])
     return newlist
 
 def replaceStr(nodelist,keywords):
@@ -257,16 +255,27 @@ def replaceStr(nodelist,keywords):
     return nodelist
 
 def proDuplicateNodeName(nodes):
-    names = []
-    for key in nodes.keys():
-        nodelist = nodes[key]
-        for node in nodelist:
-            index = 2
-            s = node['tag']
-            while node['tag'] in names:
-                node['tag'] = s + ' ' + str(index)
-                index += 1
-            names.append(node['tag'])
+    existing_tags = set()
+    name_counters = {}
+    for group_name, node_list in nodes.items():
+        for node in node_list:
+            current_tag = node.get('tag', '').strip()
+            if not current_tag:
+                current_tag = "Unknown"
+            if current_tag not in existing_tags:
+                existing_tags.add(current_tag)
+                if current_tag not in name_counters:
+                    name_counters[current_tag] = 2
+            else:
+                idx = name_counters.get(current_tag, 2)
+                while True:
+                    new_tag = f"{current_tag} [{idx}]"
+                    if new_tag not in existing_tags:
+                        node['tag'] = new_tag
+                        existing_tags.add(new_tag)
+                        name_counters[current_tag] = idx + 1
+                        break
+                    idx += 1
 
 def removeNodes(nodelist):
     newlist = []
@@ -280,9 +289,7 @@ def removeNodes(nodelist):
             temp_list.append(_node)
             newlist.append(node)
     print('去除了 '+str(i)+' 个重复节点')
-    print('Đã xóa các proxy trùng lặp '+str(i))
     print('实际获取 '+str(len(newlist))+' 个节点')
-    print('Thực tế nhận được '+str(len(newlist))+' proxy')
     return newlist
 
 def prefixStr(nodelist,prestr):
@@ -290,21 +297,30 @@ def prefixStr(nodelist,prestr):
         node['name'] = prestr+node['name'].strip()
     return nodelist
 
-def getResponse(url, custom_user_agent=None):
-    response = None
+async def getResponse(url, custom_user_agent=None):
     headers = {
-        'User-Agent': custom_user_agent if custom_user_agent else 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15'
-        #'User-Agent': 'clash.meta'
+        'User-Agent': custom_user_agent if custom_user_agent else (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15'
+        )
     }
+    timeout = httpx.Timeout(10.0, connect=5.0)
     try:
-        response = requests.get(url,headers=headers,timeout=5000)
-        if response.status_code==200:
-            return response
-        else:
-            return None
-    except:
-        return None
-    
+        async with httpx.AsyncClient(verify=True, timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response
+    except Exception:
+        pass
+    return None
+
 class ConfigSSH:
     server = {'ip':None,'port':22,'user':None,'password':''}
     def __init__(self,server:dict) -> None:
@@ -314,23 +330,30 @@ class ConfigSSH:
             if k in server.keys():
                 self.server[k] = server[k]
     def connect(self):
-        ssh = paramiko.SSHClient()
-        ssh.load_system_host_keys()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(hostname=self.server['ip'],port=22, username=self.server['user'], password=self.server['password'])
-        self.ssh = ssh
+        import warnings
+        import paramiko
+        from cryptography.utils import CryptographyDeprecationWarning
+        with warnings.catch_warnings(action="ignore", category=CryptographyDeprecationWarning):
+            ssh = paramiko.SSHClient()
+            ssh.load_system_host_keys()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=self.server['ip'],port=22, username=self.server['user'], password=self.server['password'])
+            self.ssh = ssh
 
     def execCMD(self,command:str):
         stdin, stdout, stderr = self.ssh.exec_command(command) 
         print(stdout.read().decode('utf-8')) 
 
     def uploadFile(self,source:str,target:str):
+        from scp import SCPClient
         scp = SCPClient(self.ssh.get_transport())
         scp.put(source, recursive=True, remote_path=target)
 
     def getFile(self,remote:str,local:str):
+        from scp import SCPClient
         scp = SCPClient(self.ssh.get_transport())
         scp.get(remote,local)
 
     def close(self):
-        self.ssh.close()
+        if hasattr(self, 'ssh'):
+            self.ssh.close()

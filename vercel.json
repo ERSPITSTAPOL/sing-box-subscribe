@@ -6,6 +6,5 @@
     },
     "rewrites": [
         { "source": "/(.*)", "destination": "/api/app" }
-    ],
-    "outputDirectory": "tmp"
+    ]
 }
