@@ -1,0 +1,26 @@
+[project]
+name = "sing-box-subscribe"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx[http2]",
+    "h2",
+    "jinja2",
+    "PyYAML",
+    "orjson",
+    "paramiko",
+    "scp",
+    "chardet",
+    "python-multipart"
+]
+
+[tool.setuptools]
+py-modules = ["main", "tool", "gh_proxy_helper"]
+packages = ["api", "parsers"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
