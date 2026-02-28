@@ -2,15 +2,19 @@
 url = "https://pypi.org/simple"
 verify_ssl = true
 name = "pypi"
- 
+
 [packages]
-flask = "*"
-requests = "*"
+fastapi = "*"
+uvicorn = "*"
+httpx = {extras = ["http2"], version = "*"}
+h2 = "*"
+jinja2 = "*"
+PyYAML = "*"
+orjson = "*"
 paramiko = "*"
 scp = "*"
 chardet = "*"
-pyyaml = "*"
-"ruamel.yaml" = "*"
- 
+python-multipart = "*"
+
 [requires]
-python_version = "3.12"
+python_version = "3.14"
