@@ -1,68 +1,820 @@
-import json, os, tool, time, requests, sys, importlib, argparse, yaml, ruamel.yaml
+import os
+import importlib
 import re
-from datetime import datetime
-from urllib.parse import urlparse
-from collections import OrderedDict
-from api.app import TEMP_DIR
-from parsers.clash2base64 import clash2v2ray
+import asyncio
+import tool
 from gh_proxy_helper import set_gh_proxy
+from contextvars import ContextVar
+from urllib.parse import urlparse
+from collections import defaultdict, deque
+import orjson as json
+import yaml
+from yaml import CSafeLoader
 
-parsers_mod = {}
-providers = None
-color_code = [31, 32, 33, 34, 35, 36, 91, 92, 93, 94, 95, 96]
+URI_PARSERS = {
+    'vmess': 'parsers.vmess',
+    'vless': 'parsers.vless',
+    'shadowsocks': 'parsers.ss',
+    'shadowsocksr': 'parsers.ssr',
+    'trojan': 'parsers.trojan',
+    'tuic': 'parsers.tuic',
+    'hysteria': 'parsers.hysteria',
+    'hysteria2': 'parsers.hysteria2',
+    'wireguard': 'parsers.wg',
+    'anytls': 'parsers.anytls',
+    'socks': 'parsers.socks',
+    'http': 'parsers.http',
+    'https': 'parsers.https',
+}
+CLASH_CONVERTERS = {
+    'clash2sing': 'parsers.clash2sing',
+    # 'clash2v2ray': 'parsers.clash2base64',   # No used anymore
+}
+_PARSER_CACHE = {}
+_PROTO_FACTORY_CACHE = {}
+_EX_PROTOCOL_CACHE = {}
+_parsers_warmed = False
+_warmup_lock: asyncio.Lock | None = None
+_warmup_done: asyncio.Event | None = None
+COMMON_PARSERS = {'vless', 'ss', 'trojan', 'hysteria2', 'anytls', 'clash2sing'}
+ENDPOINT_TYPES = {'wireguard', 'tailscale'}
+providers_ctx: ContextVar[dict] = ContextVar("providers_ctx")
 
+RE_BASE64 = re.compile(r'^[A-Za-z0-9+/=_ \-]+$')
+RE_CLEAN_COMMENT = re.compile(r'//.*')
+RE_PROXIES = re.compile(r'^proxies:.*?(?=\n\S|\Z)', re.M | re.S)
 
-def loop_color(text):
-    text = '\033[1;{color}m{text}\033[0m'.format(color=color_code[0], text=text)
-    color_code.append(color_code.pop(0))
-    return text
+def _get_warmup_lock():
+    global _warmup_lock
+    if _warmup_lock is None:
+        _warmup_lock = asyncio.Lock()
+    return _warmup_lock
 
+def _get_warmup_done():
+    global _warmup_done
+    if _warmup_done is None:
+        _warmup_done = asyncio.Event()
+    return _warmup_done
 
-def init_parsers():
-    b = os.walk('parsers')
-    for path, dirs, files in b:
-        for file in files:
-            f = os.path.splitext(file)
-            if f[1] == '.py':
-                parsers_mod[f[0]] = importlib.import_module('parsers.' + f[0])
-
-
-def get_template():
-    template_dir = 'config_template'  # 配置模板文件夹路径
-    template_files = os.listdir(template_dir)  # 获取文件夹中的所有文件
-    template_list = [os.path.splitext(file)[0] for file in template_files if
-                     file.endswith('.json')]  # 移除扩展名并过滤出以.json结尾的文件
-    template_list.sort()  # 对文件名进行排序
+def get_template_list():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    template_dir = os.path.join(base_dir, 'config_template')
+    if not os.path.isdir(template_dir):
+        return []
+    template_list = []
+    with os.scandir(template_dir) as it:
+        for entry in it:
+            if not entry.is_file() or not entry.name.lower().endswith('.json'):
+                continue
+            template_list.append(os.path.splitext(entry.name)[0])
+    template_list.sort()
     return template_list
 
+def _read_json(path: str) -> dict:
+    content = tool.readFile(path)
+    return json.loads(content)
 
-def load_json(path):
-    return json.loads(tool.readFile(path))
+async def generate_config_logic(input_providers, client, gh_proxy_index=None):
+    providers_ctx.set(input_providers)
+    template_value = str(input_providers.get('config_template', '')).strip()
+    if template_value and not template_value.isdigit():
+        try:
+            response = await client.get(template_value, timeout=5)
+            response.raise_for_status()
+            config = await asyncio.to_thread(json.loads, response.content)
+        except Exception as e:
+            raise Exception(f"Fetch remote template failed: {str(e)}")
+    else:
+        template_list = await asyncio.to_thread(get_template_list)
+        if not template_list:
+            raise Exception("No template files found in config_template/")
+        template_index = min(max(int(template_value or 0) - 1, 0), len(template_list) - 1)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        file_name = f"{template_list[template_index]}.json"
+        template_path = os.path.join(base_dir, "config_template", file_name)
+        if not os.path.exists(template_path):
+            parent_dir = os.path.dirname(base_dir)
+            template_path = os.path.join(parent_dir, "config_template", file_name)
+        config = await asyncio.to_thread(_read_json, template_path)
 
+    nodes = await process_subscribes(input_providers["subscribes"], client)
 
-def process_subscribes(subscribes):
+    if input_providers.get('Only-nodes'):
+        endpoint_nodes = []
+        outbound_nodes = []
+        for contents in nodes.values():
+            for n in contents:
+                if n.get('type') in ENDPOINT_TYPES:
+                    endpoint_nodes.append(n)
+                else:
+                    outbound_nodes.append(n)
+        final_config = {"outbounds": outbound_nodes}
+        if endpoint_nodes:
+            final_config["endpoints"] = endpoint_nodes
+        return final_config
+
+    if gh_proxy_index and str(gh_proxy_index).strip().lower() not in ['none', '']:
+        gh_proxy_value = str(gh_proxy_index).strip()
+        if config.get("route") and config["route"].get("rule_set"):
+            rule_sets = config["route"]["rule_set"]
+            urls = [item["url"] for item in rule_sets if "url" in item]
+            if urls:
+                new_urls = await asyncio.to_thread(set_gh_proxy, urls, gh_proxy_value)
+                url_idx = 0
+                for item in rule_sets:
+                    if "url" in item:
+                        item["url"] = new_urls[url_idx]
+                        url_idx += 1
+
+    final_config = await asyncio.to_thread(combin_to_config, config, nodes)
+    return final_config
+
+async def process_subscribes(subscribes, client, timeout=10.0):
     nodes = {}
-    for subscribe in subscribes:
-        if 'enabled' in subscribe and not subscribe['enabled']:
+    async def worker(sub):
+        if sub.get('enabled') is False:
+            return None
+        tag = sub.get('tag')
+        try:
+            return await asyncio.wait_for(
+                process_single_subscribe(sub, client),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            print(f"Subscription [{tag}] timed out, skipping")
+        except Exception as exc:
+            print(f"Subscription [{tag}] failed: {exc}")
+        return None
+    tasks = [asyncio.create_task(worker(sub)) for sub in subscribes]
+    for future in asyncio.as_completed(tasks):
+        result = await future
+        if result is None:
             continue
-        if 'sing-box-subscribe-doraemon.vercel.app' in subscribe['url']:
+        target_tag, _nodes = result
+        if target_tag is None:
             continue
-        _nodes = get_nodes(subscribe['url'])
-        if _nodes and len(_nodes) > 0:
-            add_prefix(_nodes, subscribe)
-            add_emoji(_nodes, subscribe)
-            nodefilter(_nodes, subscribe)
-            if subscribe.get('subgroup'):
-                subscribe['tag'] = subscribe['tag'] + '-' + subscribe['subgroup'] + '-' + 'subgroup'
-            if not nodes.get(subscribe['tag']):
-                nodes[subscribe['tag']] = []
-            nodes[subscribe['tag']] += _nodes
-        else:
-            print('没有在此订阅下找到节点，跳过')
-            # print('Không tìm thấy proxy trong link thuê bao này, bỏ qua')
-    tool.proDuplicateNodeName(nodes)
+        nodes.setdefault(target_tag, []).extend(_nodes)
+    if nodes:
+        tool.DuplicateNodeName(nodes)
     return nodes
 
+async def process_single_subscribe(subscribe, client):
+    sub_get = subscribe.get
+    tag_name = sub_get('tag')
+    subgroup = sub_get('subgroup')
+    url = sub_get('url')
+    user_agent = sub_get('User-Agent')
+    prefix = sub_get('prefix')
+    suffix = sub_get('suffix')
+    ex_node_name = sub_get('ex-node-name')
+    exclude_protocol = sub_get('exclude_protocol')
+    emoji = sub_get('emoji')
+    target_tag = tag_name
+    try:
+        _nodes = await get_nodes(client, url, user_agent, exclude_protocol)
+        if not _nodes:
+            print(f"No nodes found under subscription [{tag_name}], skipping")
+            return None, None
+        if ex_node_name is not None or exclude_protocol is not None:
+            nodefilter(_nodes, ex_node_name, exclude_protocol)
+        if emoji:
+            add_emoji(_nodes)
+        if prefix is not None or suffix is not None:
+            add_prefix_and_suffix(_nodes, prefix, suffix)
+        if subgroup:
+            subgroup_str = str(subgroup).strip()
+            if subgroup_str:
+                target_tag = f"{tag_name}-{subgroup_str}-subgroup"
+        return target_tag, _nodes
+    except Exception as e:
+        print(f"Error occurred while processing subscription [{tag_name}]: {e}")
+        return None, None
+
+async def get_nodes(client, url, user_agent, exclude_protocol):
+    if url.startswith('sub://'):
+        url = tool.b64Decode(url[6:]).decode('utf-8')
+    urlstr = urlparse(url)
+    if not urlstr.scheme:
+        try:
+            asyncio.create_task(warmup_parsers(URI_PARSERS, timeout=0.5))
+            content = await asyncio.to_thread(lambda: tool.b64Decode(url).decode('utf-8'))
+            data = await asyncio.to_thread(parse_content, content, exclude_protocol)
+            return [node for item in data for node in (item if isinstance(item, tuple) else [item])]
+        except Exception as e:
+            print(f"Base64 decode failed, returning original text: {url}, error: {e}")
+            return [url]
+    else:
+        content = await get_content_from_url(client, url, user_agent)
+
+    contents = content if isinstance(content, list) else [content]
+    nodes_list = []
+
+    has_clash = any(isinstance(c, dict) and 'proxies' in c for c in contents)
+    if has_clash:
+        mod = await asyncio.to_thread(_load_clash_converter, 'clash2sing')
+        c2s = getattr(mod, 'parse', None) if mod else None
+    else:
+        c2s = None
+
+    for content_item in contents:
+        if isinstance(content_item, dict):
+            if 'proxies' in content_item:
+                if not c2s:
+                    print(f"Parser load failed [clash2sing]: unable to load module")
+                    continue
+                for proxy in content_item['proxies']:
+                    res = c2s(proxy)
+                    if not res:
+                        continue
+                    if isinstance(res, tuple):
+                        nodes_list.extend(list(res))
+                    else:
+                        nodes_list.append(res)
+            elif 'outbounds' in content_item:
+                excluded_types = {"selector", "urltest", "direct", "block", "dns"}
+                for outbound in content_item.get('outbounds', []):
+                    if outbound.get("type") in excluded_types:
+                        continue
+                    nodes_list.append(outbound)
+        elif isinstance(content_item, str):
+            data = await asyncio.to_thread(parse_content, content_item, exclude_protocol)
+            nodes_list.extend([node for item in data for node in (item if isinstance(item, tuple) else [item])])
+    return nodes_list
+
+async def get_content_from_url(client, url, user_agent=None, max_retries=3, can_fetch_sub=True):
+    global _parsers_warmed
+    DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    UA = user_agent or DEFAULT_UA
+    print(f"Processing: {url}")
+    # print(f"User-Agent: {UA}")
+    prefixes = ("vmess://", "vless://", "anytls://", "ss://", "ssr://", "trojan://", "tuic://", "hysteria://", "hysteria2://", "hy2://", "wg://", "wireguard://", "http2://", "socks://", "socks5://")
+
+    if url.startswith(prefixes):
+        return tool.noblankLine(url)
+
+    def internal_recognize(text, content_bytes):
+        if not text or text.isspace():
+            return None
+        # printed_stages = set()
+
+        def action_yaml():
+            if '\t' in text:
+                yaml_text = text.replace('\t', ' ')
+            else:
+                yaml_text = text
+            # ^proxies:[\s\S]*?(?=\n\S|\z)
+            match = RE_PROXIES.search(yaml_text)
+            to_parse = match.group(0) if match else yaml_text
+            try:
+                data = yaml.load(to_parse, Loader=CSafeLoader)
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                print(f"YAML Parseing Error: {e}")
+            return None
+
+        def action_json():
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                try:
+                    cleaned = RE_CLEAN_COMMENT.sub('', text)
+                    data = json.loads(cleaned)
+                    if isinstance(data, dict):
+                        return data
+                except Exception as e:
+                    print(f"JSON Parseing Error: {e}")
+            return None
+
+        def action_URI():
+            lines = text.splitlines()
+            if any(line.lstrip()[:16].startswith(prefixes) for line in lines if line.strip()):
+                return tool.noblankLine(text)
+            try:
+                decoded = tool.b64Decode(text)
+                if decoded:
+                    if isinstance(decoded, bytes):
+                        return decoded.decode('utf-8')
+                    return decoded
+                return None
+            except Exception:
+                return None
+
+        methods = {
+            'yaml': action_yaml,
+            'json': action_json,
+            'URI': action_URI
+        }
+        tried_methods = set()
+        primary = None
+
+        ua_lower = UA.lower()
+        if 'sing' in ua_lower or 'box' in ua_lower:
+            primary = 'json'
+        elif 'clash' in ua_lower:
+            primary = 'yaml'
+        elif 'ray' in ua_lower:
+            primary = 'URI'
+        if primary:
+            result = methods[primary]()
+            tried_methods.add(primary)
+        #     if 'stage1' not in printed_stages:
+        #         print(f"[Stage1] Attempting preferred ({primary}), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('stage1')
+            if isinstance(result, (dict, str)):
+        #         if 'result' not in printed_stages:
+        #             print(f"[Stage1 result] Preferred ({primary}) returned a valid result, methods tried so far: {sorted(tried_methods)}")
+        #             printed_stages.add('result')
+                return result
+
+        if 'json' not in tried_methods and (text.startswith('{') or 'outbounds' in text):
+        #     if 'stage2' not in printed_stages:
+        #         print(f"[Stage2] Feature match triggered (json), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('stage2')
+            result = methods['json']()
+            tried_methods.add('json')
+            if isinstance(result, dict):
+        #         print(f"[Stage2 result] Feature match succeeded (json), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('result')
+                return result
+        #     else:
+        #         print(f"[Stage2 result] JSON parsing failed, methods tried so far: {sorted(tried_methods)}")
+        elif 'yaml' not in tried_methods and any(line.lstrip().startswith('proxies') for line in text.splitlines()):
+        #     if 'stage2' not in printed_stages:
+        #         print(f"[Stage2] Feature match triggered (yaml), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('stage2')
+            result = methods['yaml']()
+            tried_methods.add('yaml')
+            if isinstance(result, dict):
+        #         print(f"[Stage2 result] Feature match succeeded (yaml), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('result')
+                return result
+        #     else:
+        #         print(f"[Stage2 result] YAML parsing failed, methods tried so far: {sorted(tried_methods)}"
+        elif 'URI' not in tried_methods and (text.startswith(prefixes) or RE_BASE64.match(text)):
+        #     if 'stage2' not in printed_stages:
+        #         print(f"[Stage2] Feature match triggered (URI), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('stage2')
+            result = methods['URI']()
+            tried_methods.add('URI')
+            if isinstance(result, str):
+        #         print(f"[Stage2 result] Feature match succeeded (URI), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('result')
+                return result
+        #     else:
+        #         print(f"[Stage2 result] URI parsing failed, methods tried so far: {sorted(tried_methods)}")
+        # if 'stage2_end' not in printed_stages:
+        #     print(f"[Stage2 end] tried_methods: {sorted(tried_methods)}")
+        #     printed_stages.add('stage2_end')
+
+        remaining = [name for name in methods.keys() if name not in tried_methods]
+        # if 'stage3_start' not in printed_stages:
+        #     print(f"[Stage3] Before fallback attempts, tried_methods: {sorted(tried_methods)}, remaining: {remaining}")
+        #     printed_stages.add('stage3_start')
+        for name in remaining:
+            result = methods[name]()
+            tried_methods.add(name)
+        #     if 'stage3' not in printed_stages:
+        #         print(f"[Stage3] Fallback attempt ({name}), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('stage3')
+            if isinstance(result, (dict, str)):
+        #         print(f"[Stage3 result] Fallback method succeeded ({name}), methods tried so far: {sorted(tried_methods)}")
+        #         printed_stages.add('result')
+                return result
+        # if 'final' not in printed_stages:
+        #     print(f"[Final] Unable to parse into structured data, methods tried: {sorted(tried_methods)}")
+        #     printed_stages.add('final')
+        return text
+
+    headers = {'User-Agent': UA}
+    response = None
+    concount = 1
+
+    while concount <= max_retries:
+        try:
+            if concount == 1 and not _parsers_warmed:
+                resp_task = asyncio.create_task(client.get(url, headers=headers))
+                warm_task = asyncio.create_task(warmup_parsers(URI_PARSERS, timeout=1.0))
+                done, _ = await asyncio.wait({resp_task, warm_task}, return_when=asyncio.FIRST_COMPLETED)
+                if resp_task not in done:
+                    response = await resp_task
+                else:
+                    response = resp_task.result()
+            else:
+                response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            break
+        except Exception as e:
+            print(f"Connection error: {e}, retrying attempt {concount}...")
+            concount += 1
+    if not response:
+        print('Fetch failed, Skipping this subscription')
+        return ''
+
+    try:
+        main_text = response.content.decode('utf-8-sig')
+    except Exception:
+        main_text = response.text
+    if not main_text:
+        try:
+            headers['User-Agent'] = 'v2rayNG'
+            response = await client.get(url, headers=headers)
+            main_text = response.content.decode('utf-8-sig')
+        except Exception:
+            pass
+    response_text = await asyncio.to_thread(internal_recognize, main_text, response.content)
+
+    if isinstance(response_text, dict):
+        return response_text
+    if response_text is None:
+        return None
+
+    final_content = []
+    lines = response_text.splitlines()
+    sub_links = []
+
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        if can_fetch_sub and line.startswith(("http://", "https://")) and line != url:
+            sub_links.append(line)
+        else:
+            final_content.append(line)
+
+    if sub_links:
+        print(f"Found {len(sub_links)} sub-links: {sub_links}")
+        sub_tasks = [
+            asyncio.create_task(
+                get_content_from_url(client, link, user_agent=UA, max_retries=2, can_fetch_sub=False)
+            )
+            for link in sub_links
+        ]
+        for future in asyncio.as_completed(sub_tasks):
+            try:
+                res = await future
+            except Exception as e:
+                print(f"Fetch sub-link failed: {e}")
+                continue
+            if not res:
+                continue
+            if isinstance(res, list):
+                final_content.extend(res)
+            else:
+                final_content.append(res)
+
+    has_dict = any(isinstance(item, dict) for item in final_content)
+    if has_dict:
+        if len(final_content) == 1 and isinstance(final_content[0], dict):
+            return final_content[0]
+        return final_content
+
+    return tool.noblankLine('\n'.join([str(x) for x in final_content if isinstance(x, str)]))
+
+async def warmup_parsers(URI_PARSERS, timeout=1.0):
+    global _parsers_warmed, _PARSER_CACHE
+    if _parsers_warmed or _get_warmup_done().is_set():
+        return
+    async with _get_warmup_lock():
+        if _parsers_warmed:
+            return
+        coros = []
+        async def _import_one(proto):
+            if proto in URI_PARSERS:
+                await asyncio.to_thread(_load_parser, proto)
+            elif proto in CLASH_CONVERTERS:
+                await asyncio.to_thread(_load_clash_converter, proto)
+        for proto in COMMON_PARSERS:
+            if proto not in _PARSER_CACHE:
+                coros.append(_import_one(proto))
+        if not coros:
+            _parsers_warmed = True
+            _get_warmup_done().set()
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*coros), timeout=timeout)
+            _parsers_warmed = True
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for proto in URI_PARSERS:
+                if proto not in _PROTO_FACTORY_CACHE:
+                    factory = get_parser(f"{proto}://")
+                    if factory:
+                        _PROTO_FACTORY_CACHE[proto] = factory
+            _get_warmup_done().set()
+
+def parse_content(content, exclude_protocol_override):
+    lines = [t.strip() for t in content.splitlines() if t.strip()]
+    if not lines:
+        return []
+    task_factories = {}
+    unique_protos = {tool.get_protocol(line) for line in lines}
+    unique_protos.discard(None)
+    for proto in unique_protos:
+        if exclude_protocol_override:
+            factory = get_parser(f"{proto}://", exclude_protocol_override)
+        elif proto in _PROTO_FACTORY_CACHE:
+            factory = _PROTO_FACTORY_CACHE[proto]
+        else:
+            factory = get_parser(f"{proto}://")
+        if factory:
+            task_factories[proto] = factory
+    nodelist = []
+    _get_proto = tool.get_protocol
+    for line in lines:
+        proto = _get_proto(line)
+        if proto in task_factories:
+            try:
+                node = task_factories[proto](line)
+                if node:
+                    nodelist.append(node)
+            except Exception as e:
+                print(f"Error: {e}, content: {line[:30]}")
+                continue
+    return nodelist
+
+def get_parser(node, exclude_protocol_override=None):
+    canonical = tool.get_protocol(node)
+    if not canonical:
+        return None
+    excluded_raw = exclude_protocol_override
+    if excluded_raw:
+        cache_key = tuple(excluded_raw) if isinstance(excluded_raw, list) else excluded_raw
+        ex_set = _EX_PROTOCOL_CACHE.get(cache_key)
+        if ex_set is None:
+            if isinstance(excluded_raw, str):
+                items = [p.strip().lower() for p in excluded_raw.split(',') if p.strip()]
+            else:
+                items = [str(p).strip().lower() for p in excluded_raw]
+            ex_set = {getattr(tool, '_PROTOCOL_MAP', {}).get(p, p) for p in items}
+            _EX_PROTOCOL_CACHE[cache_key] = ex_set
+        if canonical in ex_set:
+            return None
+    mod = _load_parser(canonical)
+    return getattr(mod, 'parse', None) if mod else None
+
+def _load_parser(proto):
+    if proto in _PARSER_CACHE:
+        return _PARSER_CACHE[proto]
+    module_path = URI_PARSERS.get(proto)
+    if not module_path:
+        return None
+    try:
+        mod = importlib.import_module(module_path)
+        _PARSER_CACHE[proto] = mod
+        return mod
+    except Exception as e:
+        print(f"URI Parser loading failure [{proto}]: {e}")
+        return None
+
+def _load_clash_converter(name):
+    if name in _PARSER_CACHE:
+        return _PARSER_CACHE[name]
+    module_path = CLASH_CONVERTERS.get(name)
+    if not module_path:
+        return None
+    try:
+        mod = importlib.import_module(module_path)
+        _PARSER_CACHE[name] = mod
+        return mod
+    except Exception as e:
+        print(f"Clash converter loading failure [{name}]: {e}")
+        return None
+
+def add_emoji(nodes):
+    rename_func = tool.rename
+    for node in nodes:
+        if 'tag' in node:
+            node['tag'] = rename_func(node['tag'])
+        if (detour := node.get('detour')):
+            node['detour'] = rename_func(detour)
+
+def add_prefix_and_suffix(nodes, prefix, suffix):
+    p = prefix or ''
+    s = suffix or ''
+    if p and not s:
+        prefix_str = f"{p} "
+        for node in nodes:
+            if 'tag' in node:
+                node['tag'] = prefix_str + node['tag']
+            if (detour := node.get('detour')):
+                node['detour'] = prefix_str + detour
+    elif s and not p:
+        suffix_str = f" {s}"
+        for node in nodes:
+            if 'tag' in node:
+                node['tag'] = node['tag'] + suffix_str
+            if (detour := node.get('detour')):
+                node['detour'] = detour + suffix_str
+    else:
+        prefix_str = f"{p} "
+        suffix_str = f" {s}"
+        for node in nodes:
+            if 'tag' in node:
+                node['tag'] = prefix_str + node['tag'] + suffix_str
+            if (detour := node.get('detour')):
+                node['detour'] = prefix_str + detour + suffix_str
+
+def nodefilter(nodes, ex_node_name, exclude_protocol):
+    ex_node_str = ex_node_name
+    ex_node_protocol = exclude_protocol
+    name_list = [re.escape(s.strip()) for s in str(ex_node_str).split(',') if s.strip()] if ex_node_str else []
+    proto_list = [re.escape(s.strip()) for s in str(ex_node_protocol).split(',') if s.strip()] if ex_node_protocol else []
+    if not name_list and not proto_list:
+        return
+    name_pattern = re.compile('|'.join(name_list)) if name_list else None
+    proto_pattern = re.compile('|'.join(proto_list)) if proto_list else None
+    n_search = name_pattern.search if name_pattern else None
+    p_search = proto_pattern.search if proto_pattern else None
+    nodes[:] = [
+        node for node in nodes
+        if not (
+            (n_search(tag) if n_search and (tag := node.get('tag')) else False) or
+            (p_search(proto) if p_search and (proto := node.get('type')) else False)
+        )
+    ]
+
+def combin_to_config(config, data):
+    providers_obj = providers_ctx.get({})
+    template_func = globals().get('pro_node_template')
+    has_template_func = template_func is not None
+    set_dns_func = globals().get('set_proxy_rule_dns')
+
+    endpoint_nodes = []
+    endpoint_tags = set()
+    outbound_nodes = []
+    for members in data.values():
+        if not members: continue
+        for m in members:
+            if isinstance(m, dict):
+                tag = m.get('tag')
+                if m.get('type') in ENDPOINT_TYPES:
+                    endpoint_nodes.append(m)
+                    if tag: endpoint_tags.add(tag)
+                else:
+                    outbound_nodes.append(m)
+
+    if "outbounds" not in config:
+        config["outbounds"] = []
+    existing_tags = {o.get("tag") for o in config["outbounds"]}
+    proxy_node = next((o for o in config["outbounds"] if o.get("tag") == "Proxy"), None)
+    new_subgroup_nodes = []
+    subgroup_tags_set = set()
+    proxy_additions = []
+    proxy_additions_seen = set()
+    for group_key in data:
+        if 'subgroup' in group_key:
+            subgroup_tag = (group_key.rsplit("-", 1)[0]).rsplit("-", 1)[-1]
+            subgroup_tags_set.add(subgroup_tag)
+            if subgroup_tag not in existing_tags:
+                new_subgroup_nodes.append({
+                    'tag': subgroup_tag,
+                    'type': 'selector',
+                    'interrupt_exist_connections': True,
+                    'outbounds': ['{' + group_key + '}']
+                })
+                existing_tags.add(subgroup_tag)
+            if proxy_node and subgroup_tag not in proxy_additions_seen:
+                proxy_additions.append(subgroup_tag)
+                proxy_additions_seen.add(subgroup_tag)
+        else:
+            addition = '{' + group_key + '}'
+            if proxy_node and addition not in proxy_additions_seen:
+                proxy_additions.append(addition)
+                proxy_additions_seen.add(addition)
+    if new_subgroup_nodes:
+        insert_pos = max(0, len(config["outbounds"]) - 1)
+        config["outbounds"][insert_pos:insert_pos] = new_subgroup_nodes
+    if proxy_node and proxy_additions:
+        if "outbounds" not in proxy_node:
+            proxy_node["outbounds"] = []
+        if isinstance(proxy_node["outbounds"], str):
+            proxy_node["outbounds"] = [proxy_node["outbounds"]]
+        current_proxy_tags = set(proxy_node["outbounds"])
+        final_additions = [t for t in proxy_additions if t not in current_proxy_tags]
+        if final_additions:
+            all_idx = next((i for i, t in enumerate(proxy_node["outbounds"]) if t == '{all}'), None)
+            if all_idx is not None:
+                proxy_node["outbounds"][all_idx:all_idx] = final_additions
+            else:
+                proxy_node["outbounds"].extend(final_additions)
+
+    nodes = {o.get("tag"): {'obj': o, 'resolved': []} for o in config["outbounds"]}
+    reverse_dep = defaultdict(set)
+    template_cache = {}
+
+    def get_template_result(members, obj, key):
+        cache_key = (id(members), id(obj), key)
+        if cache_key in template_cache:
+            return template_cache[cache_key]
+        res = template_func(members, obj, key) if has_template_func else members
+        final_tags = [m.get('tag') if isinstance(m, dict) else m for m in res]
+        template_cache[cache_key] = final_tags
+        return final_tags
+
+    _nodes = nodes
+    _data = data
+    _endpoint_tags = endpoint_tags
+    _subgroup_tags_set = subgroup_tags_set
+    _dead_empty = {k for k, v in data.items() if not v} - nodes.keys()
+
+    for node_tag, node in _nodes.items():
+        o = node['obj']
+        raw = o.get("outbounds", [])
+        if isinstance(raw, str): raw = [raw]
+        temp_resolved = []
+        temp_resolved_extend = temp_resolved.extend
+        temp_resolved_append = temp_resolved.append
+        has_group_reference = False
+        has_real_node = False
+        for item in raw:
+            if item.startswith('{') and item.endswith('}'):
+                key = item[1:-1]
+                target_keys = _data.keys() if key == 'all' else ([key] if key in _data else [])
+                for k in target_keys:
+                    members = _data[k]
+                    if not members: continue
+                    expanded_tags = get_template_result(members, o, k)
+                    temp_resolved_extend(t for t in expanded_tags if t not in _endpoint_tags)
+                    has_real_node = True
+            else:
+                if item in _endpoint_tags:
+                    continue
+                temp_resolved_append(item)
+                if item in _nodes and item != node_tag:
+                    has_group_reference = True
+                elif item not in _subgroup_tags_set:
+                    has_real_node = True
+        if has_group_reference and not has_real_node:
+            temp_resolved_set = set(temp_resolved)
+            for s_tag in _subgroup_tags_set:
+                if s_tag not in temp_resolved_set and s_tag not in _endpoint_tags:
+                    temp_resolved_append(s_tag)
+        node['resolved'] = [t for t in dict.fromkeys(temp_resolved) if t not in _dead_empty]
+        for tag in node['resolved']:
+            if tag in _nodes:
+                reverse_dep[tag].add(node_tag)
+
+    group_types = {'selector', 'urltest', 'fallback', 'loadbalance'}
+    dead_queue = deque()
+    alive_status = {}
+    for tag, n in nodes.items():
+        is_group = n['obj'].get('type') in group_types
+        is_alive = (not is_group) or bool(n['resolved'])
+        alive_status[tag] = is_alive
+        if not is_alive and is_group:
+            dead_queue.append(tag)
+
+    all_dead_tags = set()
+    _reverse_dep = reverse_dep
+    _alive_status = alive_status
+    while dead_queue:
+        dead_tag = dead_queue.popleft()
+        if dead_tag in all_dead_tags:
+            continue
+        all_dead_tags.add(dead_tag)
+        for parent_tag in _reverse_dep.get(dead_tag, ()):
+            if not _alive_status.get(parent_tag): continue
+            p_node = nodes[parent_tag]
+            if not any(child not in all_dead_tags and child != dead_tag
+                       for child in p_node['resolved']):
+                _alive_status[parent_tag] = False
+                dead_queue.append(parent_tag)
+
+    out = []
+    _all_dead_tags = all_dead_tags
+    for tag, node in nodes.items():
+        if not _alive_status.get(tag):
+            continue
+        obj = node['obj']
+        resolved = node['resolved']
+        if "outbounds" in obj or obj.get('type') in group_types:
+            obj["outbounds"] = [t for t in resolved if t not in _all_dead_tags]
+        obj.pop("filter", None)
+        current_default = obj.get('default')
+        if current_default and current_default not in obj.get("outbounds", []):
+            obj.pop('default', None)
+        out.append(obj)
+    out.extend(outbound_nodes)
+
+    if config.get('dns') and config['dns'].get('servers'):
+        dns_tags = {server.get('tag') for server in config['dns']['servers']}
+        asod = providers_obj.get("auto_set_outbounds_dns")
+        if asod and asod.get('proxy') and asod.get('direct'):
+            if asod['proxy'] in dns_tags and asod['direct'] in dns_tags:
+                if set_dns_func: set_dns_func(config)
+    if endpoint_nodes:
+        config['endpoints'] = endpoint_nodes
+
+    config['outbounds'] = out
+    return config
+
+def pro_node_template(data_nodes, config_outbound, group):
+    if config_outbound.get('filter'):
+        data_nodes = nodes_filter(data_nodes, config_outbound['filter'], group)
+    return [node.get('tag') for node in data_nodes]
 
 def nodes_filter(nodes, filter, group):
     for a in filter:
@@ -71,290 +823,26 @@ def nodes_filter(nodes, filter, group):
         nodes = action_keywords(nodes, a['action'], a['keywords'])
     return nodes
 
-
 def action_keywords(nodes, action, keywords):
-    # filter将按顺序依次执行
-    # "filter":[
-    #         {"action":"include","keywords":[""]},
-    #         {"action":"exclude","keywords":[""]}
-    #     ]
-    temp_nodes = []
-    flag = False
-    if action == 'exclude':
-        flag = True
-    '''
-    # 空关键字过滤
-    '''
-    # Join the patterns list into a single pattern, separated by '|'
-    combined_pattern = '|'.join(keywords)
-
-    # If the combined pattern is empty or only contains whitespace, return the original nodes
-    if not combined_pattern or combined_pattern.isspace():
+    if action == 'all' or not keywords:
         return nodes
-
-    # Compile the combined regex pattern
-    compiled_pattern = re.compile(combined_pattern)
-
-    for node in nodes:
-        name = node['tag']
-        # Use regex to check for a match
-        match_flag = bool(compiled_pattern.search(name))
-
-        # Use XOR to decide if the node should be included based on the action
-        if match_flag ^ flag:
-            temp_nodes.append(node)
-
-    return temp_nodes
-
-
-def add_prefix(nodes, subscribe):
-    if subscribe.get('prefix'):
-        for node in nodes:
-            node['tag'] = subscribe['prefix'] + node['tag']
-            if node.get('detour'):
-                node['detour'] = subscribe['prefix'] + node['detour']
-
-
-def add_emoji(nodes, subscribe):
-    if subscribe.get('emoji'):
-        for node in nodes:
-            node['tag'] = tool.rename(node['tag'])
-            if node.get('detour'):
-                node['detour'] = tool.rename(node['detour'])
-
-
-def nodefilter(nodes, subscribe):
-    if subscribe.get('ex-node-name'):
-        ex_nodename = re.split(r'[,\|]', subscribe['ex-node-name'])
-        for exns in ex_nodename:
-            for node in nodes[:]:  # 遍历 nodes 的副本，以便安全地删除元素
-                if exns in node['tag']:
-                    nodes.remove(node)
-
-
-def get_nodes(url):
-    if url.startswith('sub://'):
-        url = tool.b64Decode(url[6:]).decode('utf-8')
-    urlstr = urlparse(url)
-    if not urlstr.scheme:
-        try:
-            content = tool.b64Decode(url).decode('utf-8')
-            data = parse_content(content)
-            processed_list = []
-            for item in data:
-                if isinstance(item, tuple):
-                    processed_list.extend([item[0], item[1]])  # 处理shadowtls
-                else:
-                    processed_list.append(item)
-            return processed_list
-        except:
-            content = get_content_form_file(url)
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    if action == 'regex':
+        pattern_str = '|'.join(keywords)
     else:
-        content = get_content_from_url(url)
-    # print (content)
-    if type(content) == dict:
-        if 'proxies' in content:
-            share_links = []
-            for proxy in content['proxies']:
-                share_links.append(clash2v2ray(proxy))
-            data = '\n'.join(share_links)
-            data = parse_content(data)
-            processed_list = []
-            for item in data:
-                if isinstance(item, tuple):
-                    processed_list.extend([item[0], item[1]])  # 处理shadowtls
-                else:
-                    processed_list.append(item)
-            return processed_list
-        elif 'outbounds' in content:
-            outbounds = []
-            excluded_types = {"selector", "urltest", "direct", "block", "dns"}
-            filtered_outbounds = [outbound for outbound in content['outbounds'] if outbound.get("type") not in excluded_types]
-            outbounds.extend(filtered_outbounds)
-            return outbounds
-    else:
-        data = parse_content(content)
-        processed_list = []
-        for item in data:
-            if isinstance(item, tuple):
-                processed_list.extend([item[0], item[1]])  # 处理shadowtls
-            else:
-                processed_list.append(item)
-        return processed_list
-
-
-def parse_content(content):
-    # firstline = tool.firstLine(content)
-    # # print(firstline)
-    # if not get_parser(firstline):
-    #     return None
-    nodelist = []
-    for t in content.splitlines():
-        t = t.strip()
-        if len(t) == 0:
-            continue
-        factory = get_parser(t)
-        if not factory:
-            continue
-        try:
-            node = factory(t)
-        except Exception as e:  #节点解析失败，跳过
-            pass
-        if node:
-            nodelist.append(node)
-    return nodelist
-
-
-def get_parser(node):
-    proto = tool.get_protocol(node)
-    if providers.get('exclude_protocol'):
-        eps = providers['exclude_protocol'].split(',')
-        if len(eps) > 0:
-            eps = [protocol.strip() for protocol in eps]
-            if 'hy2' in eps:
-                index = eps.index('hy2')
-                eps[index] = 'hysteria2'
-            if proto in eps:
-                return None
-    if not proto or proto not in parsers_mod.keys():
-        return None
-    return parsers_mod[proto].parse
-
-
-def get_content_from_url(url, n=10):
-    UA = ''
-    print('处理: \033[31m' + url + '\033[0m')
-    # print('Đang tải link đăng ký: \033[31m' + url + '\033[0m')
-    prefixes = ["vmess://", "vless://", "ss://", "ssr://", "trojan://", "tuic://", "hysteria://", "hysteria2://",
-                "hy2://", "wg://", "wireguard://", "http2://", "socks://", "socks5://"]
-    if any(url.startswith(prefix) for prefix in prefixes):
-        response_text = tool.noblankLine(url)
-        return response_text
-    for subscribe in providers["subscribes"]:
-        if 'enabled' in subscribe and not subscribe['enabled']:
-            continue
-        if subscribe['url'] == url:
-            UA = subscribe.get('User-Agent', '')
-    response = tool.getResponse(url, custom_user_agent=UA)
-    concount = 1
-    while concount <= n and not response:
-        print('连接出错，正在进行第 ' + str(concount) + ' 次重试，最多重试 ' + str(n) + ' 次...')
-        # print('Lỗi kết nối, đang thử lại '+str(concount)+'/'+str(n)+'...')
-        response = tool.getResponse(url)
-        concount = concount + 1
-        time.sleep(1)
-    if not response:
-        print('获取错误，跳过此订阅')
-        # print('Lỗi khi tải link đăng ký, bỏ qua link đăng ký này')
-        print('----------------------------')
-        pass
+        pattern_str = '|'.join(map(str, keywords))
+    if not pattern_str.strip():
+        return nodes
     try:
-        response_content = response.content
-        response_text = response_content.decode('utf-8-sig')  # utf-8-sig 可以忽略 BOM
-        #response_encoding = response.encoding
-    except:
-        return ''
-    if response_text.isspace():
-        print('没有从订阅链接获取到任何内容')
-        # print('Không nhận được proxy nào từ link đăng ký')
-        return None
-    if not response_text:
-        response = tool.getResponse(url, custom_user_agent='clashmeta')
-        response_text = response.text
-    if any(response_text.startswith(prefix) for prefix in prefixes):
-        response_text = tool.noblankLine(response_text)
-        return response_text
-    elif 'proxies' in response_text:
-        yaml_content = response.content.decode('utf-8')
-        response_text_no_tabs = yaml_content.replace('\t', ' ') #fuckU
-        yaml = ruamel.yaml.YAML()
-        try:
-            response_text = dict(yaml.load(response_text_no_tabs))
-            return response_text
-        except:
-            pass
-    elif 'outbounds' in response_text:
-        try:
-            response_text = json.loads(response.text)
-            return response_text
-        except:
-            response_text = re.sub(r'//.*', '', response_text)
-            response_text = json.loads(response_text)
-            return response_text
-    else:
-        try:
-            response_text = tool.b64Decode(response_text)
-            response_text = response_text.decode(encoding="utf-8")
-            # response_text = bytes.decode(response_text,encoding=response_encoding)
-        except:
-            pass
-            # traceback.print_exc()
-    return response_text
-
-
-def get_content_form_file(url):
-    print('处理: \033[31m' + url + '\033[0m')
-    # print('Đang tải link đăng ký: \033[31m' + url + '\033[0m')
-    # encoding = tool.get_encoding(url)
-    file_extension = os.path.splitext(url)[1]  # 获取文件的后缀名
-    if file_extension.lower() == '.yaml':
-        with open(url, 'rb') as file:
-            content = file.read()
-        yaml_data = dict(yaml.safe_load(content))
-        share_links = []
-        for proxy in yaml_data['proxies']:
-            share_links.append(clash2v2ray(proxy))
-        node = '\n'.join(share_links)
-        processed_list = tool.noblankLine(node)
-        return processed_list
-    else:
-        data = tool.readFile(url)
-        data = bytes.decode(data, encoding='utf-8')
-        data = tool.noblankLine(data)
-        return data
-
-
-def save_config(path, nodes):
-    try:
-        if 'auto_backup' in providers and providers['auto_backup']:
-            now = datetime.now().strftime('%Y%m%d%H%M%S')
-            if os.path.exists(path):
-                os.rename(path, f'{path}.{now}.bak')
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"已删除文件，并重新保存：\033[33m{path}\033[0m")
-            # print(f"File cấu hình đã được lưu vào: \033[33m{path}\033[0m")
-        else:
-            print(f"文件不存在，正在保存：\033[33m{path}\033[0m")
-            # print(f"File không tồn tại, đang lưu tại: \033[33m{path}\033[0m")
-        tool.saveFile(path, json.dumps(nodes, indent=2, ensure_ascii=False))
-    except Exception as e:
-        print(f"保存配置文件时出错：{str(e)}")
-        # print(f"Lỗi khi lưu file cấu hình: {str(e)}")
-        # 如果保存出错，尝试使用 config_file_path 再次保存
-        config_path = json.loads(temp_json_data).get("save_config_path", "config.json")
-        CONFIG_FILE_NAME = config_path
-        config_file_path = os.path.join('/tmp', CONFIG_FILE_NAME)
-        try:
-            if os.path.exists(config_file_path):
-                os.remove(config_file_path)
-                print(f"已删除文件，并重新保存：\033[33m{config_file_path}\033[0m")
-                # print(f"File cấu hình đã được lưu vào: \033[33m{config_file_path}\033[0m")
-            else:
-                print(f"文件不存在，正在保存：\033[33m{config_file_path}\033[0m")
-                # print(f"File không tồn tại, đang lưu tại: \033[33m{config_file_path}\033[0m")
-            tool.saveFile(config_file_path, json.dumps(nodes, indent=2, ensure_ascii=False))
-            # print(f"配置文件已保存到 {config_file_path}")
-            # print(f"Tập tin cấu hình đã được lưu vào {config_file_path}")
-        except Exception as e:
-            os.remove(config_file_path)
-            print(f"已删除文件：\033[33m{config_file_path}\033[0m")
-            # print(f"Các file đã bị xóa: \033[33m{config_file_path}\033[0m")
-            print(f"再次保存配置文件时出错：{str(e)}")
-            # print(f"Lỗi khi lưu lại file cấu hình: {str(e)}")
-
+        compiled_pattern = re.compile(pattern_str, re.IGNORECASE)
+    except re.error:
+        return nodes
+    exclude = (action == 'exclude')
+    return [node for node in nodes if bool(compiled_pattern.search(node.get('tag', ''))) ^ exclude]
 
 def set_proxy_rule_dns(config):
+    providers = providers_ctx.get()
     # dns_template = {
     #     "tag": "remote",
     #     "address": "tls://1.1.1.1",
@@ -399,8 +887,8 @@ def set_proxy_rule_dns(config):
     config['dns']['rules'] = _dns_rules
     config['dns']['servers'].extend(outbound_dns)
 
-
 def pro_dns_from_route_rules(route_rule):
+    providers = providers_ctx.get({})
     dns_route_same_list = ["inbound", "ip_version", "network", "protocol", 'domain', 'domain_suffix', 'domain_keyword',
                            'domain_regex', 'geosite', "source_geoip", "source_ip_cidr", "source_port",
                            "source_port_range", "port", "port_range", "process_name", "process_path", "package_name",
@@ -415,219 +903,3 @@ def pro_dns_from_route_rules(route_rule):
         dns_rule_obj['server'] = route_rule['outbound'] + '_dns' if route_rule['outbound'] != 'direct' else \
             providers["auto_set_outbounds_dns"]['direct']
     return dns_rule_obj
-
-
-def pro_node_template(data_nodes, config_outbound, group):
-    if config_outbound.get('filter'):
-        data_nodes = nodes_filter(data_nodes, config_outbound['filter'], group)
-    return [node.get('tag') for node in data_nodes]
-
-
-def combin_to_config(config, data):
-    config_outbounds = config["outbounds"] if config.get("outbounds") else None
-    i = 0
-    for group in data:
-        if 'subgroup' in group:
-            i += 1
-            for out in config_outbounds:
-                if out.get("outbounds"):
-                    if out['tag'] == 'Proxy':
-                        out["outbounds"] = [out["outbounds"]] if isinstance(out["outbounds"], str) else out["outbounds"]
-                        if '{all}' in out["outbounds"]:
-                            index_of_all = out["outbounds"].index('{all}')
-                            out["outbounds"][index_of_all] = (group.rsplit("-", 1)[0]).rsplit("-", 1)[-1]
-                            i += 1
-                        else:
-                            out["outbounds"].insert(i, (group.rsplit("-", 1)[0]).rsplit("-", 1)[-1])
-            new_outbound = {'tag': (group.rsplit("-", 1)[0]).rsplit("-", 1)[-1], 'type': 'selector', 'outbounds': ['{' + group + '}']}
-            config_outbounds.insert(-2, new_outbound)
-            if 'subgroup' not in group:
-                for out in config_outbounds:
-                    if out.get("outbounds"):
-                        if out['tag'] == 'Proxy':
-                            out["outbounds"] = [out["outbounds"]] if isinstance(out["outbounds"], str) else out["outbounds"]
-                            out["outbounds"].append('{' + group + '}')
-    temp_outbounds = []
-    if config_outbounds:
-        # 获取 "type": "direct"的"tag"值
-        direct_item = next((item for item in config_outbounds if item.get('type') == 'direct'), None)
-        # 提前处理all模板
-        for po in config_outbounds:
-            # 处理出站
-            if po.get("outbounds"):
-                if '{all}' in po["outbounds"]:
-                    o1 = []
-                    for item in po["outbounds"]:
-                        if item.startswith('{') and item.endswith('}'):
-                            _item = item[1:-1]
-                            if _item == 'all':
-                                o1.append(item)
-                        else:
-                            o1.append(item)
-                    po['outbounds'] = o1
-                t_o = []
-                check_dup = []
-                for oo in po["outbounds"]:
-                    # 避免添加重复节点
-                    if oo in check_dup:
-                        continue
-                    else:
-                        check_dup.append(oo)
-                    # 处理模板
-                    if oo.startswith('{') and oo.endswith('}'):
-                        oo = oo[1:-1]
-                        if data.get(oo):
-                            nodes = data[oo]
-                            t_o.extend(pro_node_template(nodes, po, oo))
-                        else:
-                            if oo == 'all':
-                                for group in data:
-                                    nodes = data[group]
-                                    t_o.extend(pro_node_template(nodes, po, group))
-                    else:
-                        t_o.append(oo)
-                if len(t_o) == 0:
-                    t_o.append(direct_item['tag'])  # outbound内容为空时 添加直连 direct
-                    print('发现 {} 出站下的节点数量为 0 ，会导致sing-box无法运行，请检查config模板是否正确。'.format(
-                        po['tag']))
-                    # print('Sing-Box không chạy được vì không tìm thấy bất kỳ proxy nào trong outbound của {}. Vui lòng kiểm tra xem mẫu cấu hình có đúng không!!'.format(po['tag']))
-                    """
-                    config_path = json.loads(temp_json_data).get("save_config_path", "config.json")
-                    CONFIG_FILE_NAME = config_path
-                    config_file_path = os.path.join('/tmp', CONFIG_FILE_NAME)
-                    if os.path.exists(config_file_path):
-                        os.remove(config_file_path)
-                        print(f"已删除文件：{config_file_path}")
-                        # print(f"Các tập tin đã bị xóa: {config_file_path}")
-                    sys.exit()
-                    """
-                po['outbounds'] = t_o
-                if po.get('filter'):
-                    del po['filter']
-    for group in data:
-        temp_outbounds.extend(data[group])
-    config['outbounds'] = config_outbounds + temp_outbounds
-    # 自动配置路由规则到dns规则，避免dns泄露
-    dns_tags = [server.get('tag') for server in config['dns']['servers']]
-    asod = providers.get("auto_set_outbounds_dns")
-    if asod and asod.get('proxy') and asod.get('direct') and asod['proxy'] in dns_tags and asod['direct'] in dns_tags:
-        set_proxy_rule_dns(config)
-    # 提取 wireguard 类型内容
-    wireguard_items = [item for item in config['outbounds'] if item.get('type') == 'wireguard']
-    if wireguard_items:
-        endpoints = []
-        for item in wireguard_items:
-            endpoints.append(item)
-        new_config = OrderedDict()
-        for key, value in config.items():
-            new_config[key] = value
-            if key == 'outbounds':  # 在 outbounds 后面插入 endpoint
-                new_config['endpoints'] = endpoints
-        config = new_config
-        # 更新 outbounds，移除 wireguard 类型
-        config['outbounds'] = [item for item in config['outbounds'] if item.get('type') != 'wireguard']
-    return config
-
-
-def updateLocalConfig(local_host, path):
-    header = {
-        'Content-Type': 'application/json'
-    }
-    r = requests.put(local_host + '/configs?force=false', json={"path": path}, headers=header)
-    print(r.text)
-
-
-def display_template(tl):
-    print_str = ''
-    for i in range(len(tl)):
-        print_str += loop_color('{index}、{name} '.format(index=i + 1, name=tl[i]))
-    print(print_str)
-
-
-def select_config_template(tl, selected_template_index=None):
-    if args.template_index is not None:
-        uip = args.template_index
-    else:
-        # print ('Nhập số để chọn mẫu cấu hình tương ứng (nhấn Enter để chọn mẫu cấu hình đầu tiên theo mặc định): ')
-        uip = input('输入序号，载入对应config模板（直接回车默认选第一个配置模板）：')
-        try:
-            if uip == '':
-                return 0
-            uip = int(uip)
-            if uip < 1 or uip > len(tl):
-                print('输入了错误信息！重新输入')
-                # print('Nhập thông tin không chính xác! Vui lòng nhập lại')
-                return select_config_template(tl)
-            else:
-                uip -= 1
-        except:
-            print('输入了错误信息！重新输入')
-            # print('Nhập thông tin không chính xác! Vui lòng nhập lại')
-            return select_config_template(tl)
-    return uip
-
-
-# 自定义函数，用于解析参数为 JSON 格式
-def parse_json(value):
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        raise argparse.ArgumentTypeError(f"Invalid JSON: {value}")
-
-
-if __name__ == '__main__':
-    init_parsers()
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--temp_json_data', type=parse_json, help='临时内容')
-    parser.add_argument('--template_index', type=int, help='模板序号')
-    parser.add_argument('--gh_proxy_index', type=str, help='github加速链接')
-    args = parser.parse_args()
-    temp_json_data = args.temp_json_data
-    gh_proxy_index = args.gh_proxy_index
-    if temp_json_data and temp_json_data != '{}':
-        providers = json.loads(temp_json_data)
-    else:
-        providers = load_json('providers.json')  # 加载本地 providers.json
-    if providers.get('config_template'):
-        config_template_path = providers['config_template']
-        print('选择: \033[33m' + config_template_path + '\033[0m')
-        # print ('Mẫu cấu hình sử dụng: \033[33m' + template_list[uip] + '.json\033[0m')
-        response = requests.get(providers['config_template'])
-        response.raise_for_status()
-        config = response.json()
-    else:
-        template_list = get_template()
-        if len(template_list) < 1:
-            print('没有找到模板文件')
-            # print('Không tìm thấy file mẫu')
-            sys.exit()
-        display_template(template_list)
-        uip = select_config_template(template_list, selected_template_index=args.template_index)
-        config_template_path = 'config_template/' + template_list[uip] + '.json'
-        print('选择: \033[33m' + template_list[uip] + '.json\033[0m')
-        # print ('Mẫu cấu hình sử dụng: \033[33m' + template_list[uip] + '.json\033[0m')
-        config = load_json(config_template_path)
-    nodes = process_subscribes(providers["subscribes"])
-
-    # 处理github加速
-    if hasattr(args, 'gh_proxy_index') and str(args.gh_proxy_index).isdigit():
-        gh_proxy_index = int(args.gh_proxy_index)
-        print(gh_proxy_index)
-        urls = [item["url"] for item in config["route"]["rule_set"]]
-        new_urls = set_gh_proxy(urls, gh_proxy_index)
-        for item, new_url in zip(config["route"]["rule_set"], new_urls):
-            item["url"] = new_url
-
-
-    if providers.get('Only-nodes'):
-        combined_contents = []
-        for sub_tag, contents in nodes.items():
-            # 遍历每个机场的内容
-            for content in contents:
-                # 将内容添加到新列表中
-                combined_contents.append(content)
-        final_config = combined_contents  # 只返回节点信息
-    else:
-        final_config = combin_to_config(config, nodes)  # 节点信息添加到模板
-    save_config(providers["save_config_path"], final_config)
-    # updateLocalConfig('http://127.0.0.1:9090',providers['save_config_path'])
